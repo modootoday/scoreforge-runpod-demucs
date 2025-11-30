@@ -7,11 +7,8 @@ demucs==4.0.1
 # RunPod serverless SDK
 runpod==1.7.7
 
-# HTTP requests for downloading audio
+# HTTP requests for downloading audio and Supabase uploads
 requests==2.32.3
-
-# AWS S3 for uploading separated stems
-boto3==1.35.71
 
 # Audio file I/O
 soundfile==0.12.1

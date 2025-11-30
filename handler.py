@@ -1,6 +1,7 @@
 """
 Demucs RunPod Serverless Worker
 Separates audio into stems (vocals, drums, bass, other) using Meta's Demucs model
+Uses Supabase Storage for output files
 """
 
 import runpod
@@ -8,7 +9,6 @@ import requests
 import tempfile
 import os
 import subprocess
-import boto3
 from pathlib import Path
 import uuid
 
@@ -32,15 +32,24 @@ def download_audio(url: str) -> str:
         return f.name
 
 
-def upload_to_s3(file_path: str, bucket: str, key: str, s3_client) -> str:
-    """Upload file to S3 and return public URL"""
-    s3_client.upload_file(
-        file_path,
-        bucket,
-        key,
-        ExtraArgs={"ContentType": "audio/wav", "ACL": "public-read"},
-    )
-    return f"https://{bucket}.s3.amazonaws.com/{key}"
+def upload_to_supabase(file_path: str, bucket: str, storage_path: str, supabase_url: str, service_key: str) -> str:
+    """Upload file to Supabase Storage and return public URL"""
+    upload_url = f"{supabase_url}/storage/v1/object/{bucket}/{storage_path}"
+
+    with open(file_path, "rb") as f:
+        file_data = f.read()
+
+    headers = {
+        "Authorization": f"Bearer {service_key}",
+        "Content-Type": "audio/mpeg",
+        "x-upsert": "true",
+    }
+
+    response = requests.post(upload_url, headers=headers, data=file_data, timeout=120)
+    response.raise_for_status()
+
+    # Return public URL
+    return f"{supabase_url}/storage/v1/object/public/{bucket}/{storage_path}"
 
 
 def handler(event):
@@ -51,8 +60,8 @@ def handler(event):
         audio_url: URL to audio file
         model: (optional) Demucs model name, default 'htdemucs'
         stems: (optional) Which stems to return, default all ['vocals', 'drums', 'bass', 'other']
-        s3_bucket: S3 bucket for uploading results
-        s3_prefix: (optional) S3 key prefix, default 'demucs-outputs'
+        storage_bucket: (optional) Supabase storage bucket, default 'stems'
+        storage_prefix: (optional) Storage path prefix, default 'demucs'
 
     Output:
         vocals: URL to vocals stem
@@ -63,26 +72,22 @@ def handler(event):
     try:
         input_data = event.get("input", {})
         audio_url = input_data.get("audio_url")
-        s3_bucket = input_data.get("s3_bucket")
 
         if not audio_url:
             return {"error": "audio_url is required"}
 
-        if not s3_bucket:
-            return {"error": "s3_bucket is required for storing output stems"}
+        # Get Supabase credentials from environment
+        supabase_url = os.environ.get("SUPABASE_URL")
+        supabase_service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+        if not supabase_url or not supabase_service_key:
+            return {"error": "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables are required"}
 
         # Optional parameters
         model = input_data.get("model", "htdemucs")
         stems = input_data.get("stems", ["vocals", "drums", "bass", "other"])
-        s3_prefix = input_data.get("s3_prefix", "demucs-outputs")
-
-        # Get AWS credentials from environment
-        s3_client = boto3.client(
-            "s3",
-            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-            region_name=os.environ.get("AWS_REGION", "us-east-1"),
-        )
+        storage_bucket = input_data.get("storage_bucket", "stems")
+        storage_prefix = input_data.get("storage_prefix", "demucs")
 
         # Download audio file
         audio_path = download_audio(audio_url)
@@ -114,15 +119,21 @@ def handler(event):
             if not stems_dir.exists():
                 return {"error": f"Output directory not found: {stems_dir}"}
 
-            # Upload stems to S3
+            # Upload stems to Supabase Storage
             job_id = str(uuid.uuid4())[:8]
             output_urls = {}
 
             for stem in stems:
                 stem_file = stems_dir / f"{stem}.mp3"
                 if stem_file.exists():
-                    s3_key = f"{s3_prefix}/{job_id}/{stem}.mp3"
-                    url = upload_to_s3(str(stem_file), s3_bucket, s3_key, s3_client)
+                    storage_path = f"{storage_prefix}/{job_id}/{stem}.mp3"
+                    url = upload_to_supabase(
+                        str(stem_file),
+                        storage_bucket,
+                        storage_path,
+                        supabase_url,
+                        supabase_service_key
+                    )
                     output_urls[stem] = url
                 else:
                     output_urls[stem] = None

@@ -11,9 +11,8 @@ Meta의 Demucs 모델을 사용한 오디오 소스 분리 RunPod Serverless 워
 3. `modootoday/scoreforge-runpod-demucs` 레포 연결
 4. GPU 타입: **RTX 3090** 이상 선택
 5. Environment Variables 설정:
-   - `AWS_ACCESS_KEY_ID`
-   - `AWS_SECRET_ACCESS_KEY`
-   - `AWS_REGION` (기본값: us-east-1)
+   - `SUPABASE_URL`
+   - `SUPABASE_SERVICE_ROLE_KEY`
 6. 배포 완료 후 Endpoint URL 복사
 
 ### Docker Hub 사용
@@ -31,8 +30,8 @@ docker push your-username/scoreforge-runpod-demucs:latest
 {
   "input": {
     "audio_url": "https://example.com/audio.mp3",
-    "s3_bucket": "your-bucket-name",
-    "s3_prefix": "demucs-outputs",
+    "storage_bucket": "stems",
+    "storage_prefix": "demucs",
     "model": "htdemucs",
     "stems": ["vocals", "drums", "bass", "other"]
   }
@@ -42,8 +41,8 @@ docker push your-username/scoreforge-runpod-demucs:latest
 | 파라미터 | 타입 | 기본값 | 설명 |
 |----------|------|--------|------|
 | `audio_url` | string | (필수) | 오디오 파일 URL |
-| `s3_bucket` | string | (필수) | S3 버킷 이름 |
-| `s3_prefix` | string | "demucs-outputs" | S3 키 프리픽스 |
+| `storage_bucket` | string | "stems" | Supabase Storage 버킷 |
+| `storage_prefix` | string | "demucs" | 스토리지 경로 프리픽스 |
 | `model` | string | "htdemucs" | Demucs 모델 이름 |
 | `stems` | array | ["vocals", "drums", "bass", "other"] | 분리할 스템 |
 
@@ -51,10 +50,10 @@ docker push your-username/scoreforge-runpod-demucs:latest
 
 ```json
 {
-  "vocals": "https://bucket.s3.amazonaws.com/demucs-outputs/abc123/vocals.mp3",
-  "drums": "https://bucket.s3.amazonaws.com/demucs-outputs/abc123/drums.mp3",
-  "bass": "https://bucket.s3.amazonaws.com/demucs-outputs/abc123/bass.mp3",
-  "other": "https://bucket.s3.amazonaws.com/demucs-outputs/abc123/other.mp3"
+  "vocals": "https://xxx.supabase.co/storage/v1/object/public/stems/demucs/abc123/vocals.mp3",
+  "drums": "https://xxx.supabase.co/storage/v1/object/public/stems/demucs/abc123/drums.mp3",
+  "bass": "https://xxx.supabase.co/storage/v1/object/public/stems/demucs/abc123/bass.mp3",
+  "other": "https://xxx.supabase.co/storage/v1/object/public/stems/demucs/abc123/other.mp3"
 }
 ```
 
@@ -64,14 +63,20 @@ RunPod Endpoint에서 설정 필요:
 
 | 변수 | 설명 |
 |------|------|
-| `AWS_ACCESS_KEY_ID` | AWS 액세스 키 |
-| `AWS_SECRET_ACCESS_KEY` | AWS 시크릿 키 |
-| `AWS_REGION` | AWS 리전 (기본값: us-east-1) |
+| `SUPABASE_URL` | Supabase 프로젝트 URL |
+| `SUPABASE_SERVICE_ROLE_KEY` | Supabase 서비스 롤 키 |
+
+## Supabase Storage 설정
+
+1. Supabase Dashboard에서 `stems` 버킷 생성
+2. 버킷을 **public**으로 설정 (또는 적절한 RLS 정책 설정)
 
 ## 로컬 테스트
 
 ```bash
 pip install -r requirements.txt
+export SUPABASE_URL=https://xxx.supabase.co
+export SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 python handler.py
 ```
 
