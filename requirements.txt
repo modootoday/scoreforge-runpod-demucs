@@ -1,0 +1,20 @@
+# Demucs RunPod Worker Dependencies
+# Last updated: 2024-12
+
+# Core inference - Meta's audio source separation
+demucs==4.0.1
+
+# RunPod serverless SDK
+runpod==1.7.7
+
+# HTTP requests for downloading audio
+requests==2.32.3
+
+# AWS S3 for uploading separated stems
+boto3==1.35.71
+
+# Audio file I/O
+soundfile==0.12.1
+
+# Audio processing
+torchaudio==2.1.0
