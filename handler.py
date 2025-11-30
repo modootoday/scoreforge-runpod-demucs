@@ -2,54 +2,142 @@
 Demucs RunPod Serverless Worker
 Separates audio into stems (vocals, drums, bass, other) using Meta's Demucs model
 Uses Supabase Storage for output files
+
+Optimizations:
+- Model pre-loading at startup (eliminates cold start)
+- Direct Python API instead of subprocess
+- Streaming uploads to Supabase
+- Half-precision (float16) on GPU for 2x speed
+- Segment-based processing for memory efficiency
 """
 
 import runpod
 import requests
 import tempfile
 import os
-import subprocess
+import torch
+import torchaudio
 from pathlib import Path
 import uuid
+import shutil
+from demucs.pretrained import get_model
+from demucs.apply import apply_model
+from demucs.audio import save_audio
+
+# Detect device and optimize
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {DEVICE}")
+
+# Pre-load model at startup
+print("Loading Demucs model...")
+DEMUCS_MODEL = get_model("htdemucs")
+DEMUCS_MODEL.to(DEVICE)
+if DEVICE == "cuda":
+    DEMUCS_MODEL.half()  # Use float16 for faster GPU inference
+DEMUCS_MODEL.eval()
+print("Model loaded successfully!")
+
+# Model source names
+SOURCES = DEMUCS_MODEL.sources  # ['drums', 'bass', 'other', 'vocals']
 
 
-def download_audio(url: str) -> str:
-    """Download audio file from URL to temporary file"""
-    response = requests.get(url, timeout=300)
-    response.raise_for_status()
-
-    # Determine file extension from URL or content type
-    ext = ".wav"
-    if ".mp3" in url.lower():
-        ext = ".mp3"
-    elif ".flac" in url.lower():
-        ext = ".flac"
-    elif ".ogg" in url.lower():
-        ext = ".ogg"
-
-    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
-        f.write(response.content)
-        return f.name
+def download_audio(url: str, output_path: str) -> None:
+    """
+    Download audio file from URL using streaming.
+    Memory-efficient for large files.
+    """
+    with requests.get(url, timeout=300, stream=True) as response:
+        response.raise_for_status()
+        with open(output_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=65536):
+                if chunk:
+                    f.write(chunk)
 
 
-def upload_to_supabase(file_path: str, bucket: str, storage_path: str, supabase_url: str, service_key: str) -> str:
-    """Upload file to Supabase Storage and return public URL"""
+def upload_to_supabase_streaming(
+    file_path: str,
+    bucket: str,
+    storage_path: str,
+    supabase_url: str,
+    service_key: str,
+) -> str:
+    """Upload file to Supabase Storage using streaming and return public URL"""
     upload_url = f"{supabase_url}/storage/v1/object/{bucket}/{storage_path}"
 
-    with open(file_path, "rb") as f:
-        file_data = f.read()
+    file_size = os.path.getsize(file_path)
 
     headers = {
         "Authorization": f"Bearer {service_key}",
         "Content-Type": "audio/mpeg",
+        "Content-Length": str(file_size),
         "x-upsert": "true",
     }
 
-    response = requests.post(upload_url, headers=headers, data=file_data, timeout=120)
-    response.raise_for_status()
+    with open(file_path, "rb") as f:
+        response = requests.post(upload_url, headers=headers, data=f, timeout=120)
+        response.raise_for_status()
 
-    # Return public URL
     return f"{supabase_url}/storage/v1/object/public/{bucket}/{storage_path}"
+
+
+def separate_audio(audio_path: str, output_dir: str) -> dict[str, str]:
+    """
+    Separate audio using pre-loaded Demucs model.
+    Returns dict of stem name -> file path.
+    """
+    # Load audio
+    wav, sr = torchaudio.load(audio_path)
+
+    # Resample to model's sample rate if needed
+    if sr != DEMUCS_MODEL.samplerate:
+        wav = torchaudio.functional.resample(wav, sr, DEMUCS_MODEL.samplerate)
+        sr = DEMUCS_MODEL.samplerate
+
+    # Ensure stereo
+    if wav.shape[0] == 1:
+        wav = wav.repeat(2, 1)
+    elif wav.shape[0] > 2:
+        wav = wav[:2]
+
+    # Add batch dimension
+    wav = wav.unsqueeze(0).to(DEVICE)
+
+    # Use float16 on GPU for faster inference
+    if DEVICE == "cuda":
+        wav = wav.half()
+
+    # Apply model with optimized settings
+    with torch.no_grad():
+        sources = apply_model(
+            DEMUCS_MODEL,
+            wav,
+            device=DEVICE,
+            split=True,  # Process in segments for memory efficiency
+            overlap=0.25,
+            progress=False,
+        )
+
+    # sources shape: (batch, num_sources, channels, samples)
+    sources = sources.squeeze(0)  # Remove batch dimension
+
+    # Convert back to float32 for saving
+    if DEVICE == "cuda":
+        sources = sources.float()
+
+    # Save each stem as MP3
+    output_paths = {}
+    for idx, source_name in enumerate(SOURCES):
+        stem_path = os.path.join(output_dir, f"{source_name}.mp3")
+        save_audio(
+            sources[idx].cpu(),
+            stem_path,
+            samplerate=sr,
+            bitrate=192,  # Good quality MP3
+            clip="rescale",
+        )
+        output_paths[source_name] = stem_path
+
+    return output_paths
 
 
 def handler(event):
@@ -58,7 +146,6 @@ def handler(event):
 
     Input:
         audio_url: URL to audio file
-        model: (optional) Demucs model name, default 'htdemucs'
         stems: (optional) Which stems to return, default all ['vocals', 'drums', 'bass', 'other']
         storage_bucket: (optional) Supabase storage bucket, default 'stems'
         storage_prefix: (optional) Storage path prefix, default 'demucs'
@@ -69,6 +156,9 @@ def handler(event):
         bass: URL to bass stem
         other: URL to other instruments stem
     """
+    audio_path = None
+    output_dir = None
+
     try:
         input_data = event.get("input", {})
         audio_url = input_data.get("audio_url")
@@ -81,81 +171,76 @@ def handler(event):
         supabase_service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
         if not supabase_url or not supabase_service_key:
-            return {"error": "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables are required"}
+            return {
+                "error": "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables are required"
+            }
 
         # Optional parameters
-        model = input_data.get("model", "htdemucs")
         stems = input_data.get("stems", ["vocals", "drums", "bass", "other"])
         storage_bucket = input_data.get("storage_bucket", "stems")
         storage_prefix = input_data.get("storage_prefix", "demucs")
 
-        # Download audio file
-        audio_path = download_audio(audio_url)
+        # Create temp directory for outputs
         output_dir = tempfile.mkdtemp()
 
-        try:
-            # Run Demucs separation
-            cmd = [
-                "python",
-                "-m",
-                "demucs.separate",
-                "-n",
-                model,
-                "-o",
-                output_dir,
-                "--mp3",  # Output as MP3 for smaller file sizes
-                audio_path,
-            ]
+        # Determine file extension from URL
+        ext = ".wav"
+        url_lower = audio_url.lower()
+        if ".mp3" in url_lower:
+            ext = ".mp3"
+        elif ".flac" in url_lower:
+            ext = ".flac"
+        elif ".ogg" in url_lower:
+            ext = ".ogg"
+        elif ".m4a" in url_lower:
+            ext = ".m4a"
 
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        audio_path = os.path.join(output_dir, f"input{ext}")
 
-            if result.returncode != 0:
-                return {"error": f"Demucs failed: {result.stderr}"}
+        # Download audio file with streaming
+        download_audio(audio_url, audio_path)
 
-            # Find output directory
-            audio_name = Path(audio_path).stem
-            stems_dir = Path(output_dir) / model / audio_name
+        # Run separation
+        stem_paths = separate_audio(audio_path, output_dir)
 
-            if not stems_dir.exists():
-                return {"error": f"Output directory not found: {stems_dir}"}
+        # Upload requested stems to Supabase Storage
+        job_id = str(uuid.uuid4())[:8]
+        output_urls = {}
 
-            # Upload stems to Supabase Storage
-            job_id = str(uuid.uuid4())[:8]
-            output_urls = {}
+        for stem in stems:
+            if stem in stem_paths and os.path.exists(stem_paths[stem]):
+                storage_path = f"{storage_prefix}/{job_id}/{stem}.mp3"
+                url = upload_to_supabase_streaming(
+                    stem_paths[stem],
+                    storage_bucket,
+                    storage_path,
+                    supabase_url,
+                    supabase_service_key,
+                )
+                output_urls[stem] = url
+            else:
+                output_urls[stem] = None
 
-            for stem in stems:
-                stem_file = stems_dir / f"{stem}.mp3"
-                if stem_file.exists():
-                    storage_path = f"{storage_prefix}/{job_id}/{stem}.mp3"
-                    url = upload_to_supabase(
-                        str(stem_file),
-                        storage_bucket,
-                        storage_path,
-                        supabase_url,
-                        supabase_service_key
-                    )
-                    output_urls[stem] = url
-                else:
-                    output_urls[stem] = None
-
-            return output_urls
-
-        finally:
-            # Clean up temporary files
-            if os.path.exists(audio_path):
-                os.unlink(audio_path)
-            # Clean up output directory
-            import shutil
-
-            if os.path.exists(output_dir):
-                shutil.rmtree(output_dir)
+        return output_urls
 
     except requests.exceptions.RequestException as e:
-        return {"error": f"Failed to download audio: {str(e)}"}
-    except subprocess.TimeoutExpired:
-        return {"error": "Demucs processing timed out (>10 minutes)"}
+        return {"error": f"Failed to download/upload: {str(e)}"}
+    except torch.cuda.OutOfMemoryError:
+        return {"error": "GPU out of memory. Try a shorter audio file."}
     except Exception as e:
         return {"error": f"Separation failed: {str(e)}"}
+    finally:
+        # Clean up temporary files
+        if audio_path and os.path.exists(audio_path):
+            try:
+                os.unlink(audio_path)
+            except Exception:
+                pass
+        if output_dir and os.path.exists(output_dir):
+            try:
+                shutil.rmtree(output_dir)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

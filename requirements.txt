@@ -1,5 +1,5 @@
 # Demucs RunPod Worker Dependencies
-# Last updated: 2024-12
+# Optimized for fast GPU/CPU inference
 
 # Core inference - Meta's audio source separation
 demucs==4.0.1
@@ -10,8 +10,9 @@ runpod==1.7.7
 # HTTP requests for downloading audio and Supabase uploads
 requests==2.32.3
 
-# Audio file I/O
+# Audio file I/O (already included in base image but pinned for consistency)
 soundfile==0.12.1
-
-# Audio processing
 torchaudio==2.1.0
+
+# MP3 encoding support
+lameenc==1.7.0
