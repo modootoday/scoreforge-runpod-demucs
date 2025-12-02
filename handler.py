@@ -7,7 +7,7 @@ Optimizations:
 - Model pre-loading at startup (eliminates cold start)
 - Direct Python API instead of subprocess
 - Streaming uploads to Supabase
-- Half-precision (float16) on GPU for 2x speed
+- Automatic mixed precision (autocast) on GPU for faster inference
 - Segment-based processing for memory efficiency
 """
 
@@ -32,8 +32,8 @@ print(f"Using device: {DEVICE}")
 print("Loading Demucs model...")
 DEMUCS_MODEL = get_model("htdemucs")
 DEMUCS_MODEL.to(DEVICE)
-if DEVICE == "cuda":
-    DEMUCS_MODEL.half()  # Use float16 for faster GPU inference
+# Note: Keep model in float32 - we'll use autocast for mixed precision instead
+# Using .half() directly causes "expected scalar type Float but found Half" errors
 DEMUCS_MODEL.eval()
 print("Model loaded successfully!")
 
@@ -99,30 +99,37 @@ def separate_audio(audio_path: str, output_dir: str) -> dict[str, str]:
     elif wav.shape[0] > 2:
         wav = wav[:2]
 
-    # Add batch dimension
+    # Add batch dimension and keep as float32
     wav = wav.unsqueeze(0).to(DEVICE)
 
-    # Use float16 on GPU for faster inference
-    if DEVICE == "cuda":
-        wav = wav.half()
-
     # Apply model with optimized settings
+    # Use autocast for automatic mixed precision on GPU (safer than manual .half())
     with torch.no_grad():
-        sources = apply_model(
-            DEMUCS_MODEL,
-            wav,
-            device=DEVICE,
-            split=True,  # Process in segments for memory efficiency
-            overlap=0.25,
-            progress=False,
-        )
+        if DEVICE == "cuda":
+            with torch.amp.autocast(device_type="cuda"):
+                sources = apply_model(
+                    DEMUCS_MODEL,
+                    wav,
+                    device=DEVICE,
+                    split=True,  # Process in segments for memory efficiency
+                    overlap=0.25,
+                    progress=False,
+                )
+        else:
+            sources = apply_model(
+                DEMUCS_MODEL,
+                wav,
+                device=DEVICE,
+                split=True,
+                overlap=0.25,
+                progress=False,
+            )
 
     # sources shape: (batch, num_sources, channels, samples)
     sources = sources.squeeze(0)  # Remove batch dimension
 
-    # Convert back to float32 for saving
-    if DEVICE == "cuda":
-        sources = sources.float()
+    # Ensure float32 for saving
+    sources = sources.float()
 
     # Save each stem as MP3
     output_paths = {}
